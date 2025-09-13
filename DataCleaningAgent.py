@@ -285,6 +285,50 @@ def generate_cleaning_code(df: pd.DataFrame, recommendations: str, api_key: str,
     response = llm.invoke(messages)
     return response.content.strip()
 
+# --- Intelligent Query Routing ---
+
+def route_query(user_query, df, api_key):
+    """
+    Routes the user's query to the appropriate tool or generates pandas code.
+    """
+    features = """
+    - `missing_vals(df, user_query, api_key)`: Handles queries about missing data, imputation, etc.
+    - `get_summaries(df, user_query, api_key)`: Handles queries for statistical summaries (mean, median, etc.).
+    - `clean_data(df)`: A comprehensive cleaning function that will be triggered by keywords like 'clean my data'.
+    """
+
+    messages = [
+        SystemMessage(content=f"""
+        You are a data cleaning agent.
+        Your task is to route the user's query to the appropriate tool or generate direct pandas code.
+                                      
+        Dataset info: Shape: {df.shape}, Sample: {df.head(3).to_string()}
+
+        Available Tools:
+        {features}
+        
+        Rules:
+        - If the query is about cleaning the entire dataset (e.g., "clean my data"), generate the code: `clean_data(df)`.
+        - If the query relates to missing values, generate a call to `missing_vals`.
+        - If the query is about statistical summaries, generate a call to `get_summaries`.
+        - For other queries, generate the appropriate pandas code.
+        - Return only executable Python code, no explanations, NO MARKDOWN BLOCKS.
+        - The dataframe is always referred to as `df`.
+        - Use `print()` for any output that should be displayed to the user.
+
+        Examples:
+        - User: "clean my data" -> `clean_data(df)`
+        - User: "how should I handle missing values?" -> `missing_vals(df, "how to handle missing values", api_key)`
+        - User: "Find the mean of the 'price' column" -> `get_summaries(df, "Find the mean of the 'price' column", api_key)`
+        - User: "What are the data types of the columns?" -> `print(df.dtypes)`
+        """),
+        HumanMessage(content=f"User request: {user_query}")
+    ]
+
+    llm = ChatOpenAI(temperature=0, model_name="gpt-4o-mini", openai_api_key=api_key)
+    response = llm.invoke(messages)
+    return response.content.strip()
+
 # =================================================================================
 # STREAMLIT APPLICATION
 # =================================================================================
@@ -292,8 +336,8 @@ def generate_cleaning_code(df: pd.DataFrame, recommendations: str, api_key: str,
 def main():
     load_dotenv()
 
-    st.set_page_config(page_title="Chat with your Data", layout="wide")
-    st.title("Chat with your Data 📊")
+    st.set_page_config(page_title="Clean your Data", layout="wide")
+    st.title("Clean your Data 📊")
 
     # Initialize session states
     if "messages" not in st.session_state:
@@ -339,10 +383,9 @@ def main():
         with st.chat_message("assistant"):
             response_content = ""
             try:
-                prompt_lower = prompt.lower()
+                generated_code = route_query(prompt, st.session_state.df, st.session_state.api_key)
 
-                # --- ROBUST: End-to-End Cleaning Flow with Retry Logic ---
-                if "clean" in prompt_lower:
+                if "clean_data(df)" in generated_code:
                     with st.spinner("Analyzing data for cleaning recommendations..."):
                         recommendations = recommend_cleaning_steps(st.session_state.df, st.session_state.api_key)
                         st.markdown(f"**Data Cleaning Recommendations:**\n\n{recommendations}")
@@ -356,7 +399,6 @@ def main():
                         st.info(f"Attempt {attempt + 1} of {max_retries} to clean the data...")
                         try:
                             with st.spinner(f"Generating cleaning code (Attempt {attempt + 1})..."):
-                                # Pass the last error message to the code generator on subsequent attempts
                                 cleaning_code = generate_cleaning_code(
                                     st.session_state.df, 
                                     recommendations, 
@@ -366,20 +408,16 @@ def main():
                             
                             with st.spinner(f"Executing cleaning code (Attempt {attempt + 1})..."):
                                 local_scope = {}
-                                # Execute the generated function definition
                                 exec(cleaning_code, globals(), local_scope)
                                 clean_data_func = local_scope['clean_data']
                                 
-                                # Run the generated function
                                 cleaned_df = clean_data_func(st.session_state.df.copy())
                                 
-                                # If successful, update the session state and break the loop
                                 st.session_state.df = cleaned_df
                                 response_content = "✅ Data has been cleaned successfully!"
                                 st.success(response_content)
                                 st.session_state.messages.append({"role": "assistant", "content": response_content})
 
-                                # Provide download button
                                 csv = cleaned_df.to_csv(index=False).encode('utf-8')
                                 st.download_button(
                                     label="📥 Download Cleaned CSV",
@@ -387,35 +425,28 @@ def main():
                                     file_name="cleaned_data.csv",
                                     mime="text/csv",
                                 )
-                                break  # Exit the loop on success
+                                break
 
                         except Exception as e:
                             last_error = str(e)
                             st.warning(f"Attempt {attempt + 1} failed: {last_error}")
                             if attempt == max_retries - 1:
-                                # Final attempt failed
                                 response_content = f"❌ Failed to clean the data after {max_retries} attempts. Last error: {last_error}"
                                 st.error(response_content)
                                 st.session_state.messages.append({"role": "assistant", "content": response_content})
                     st.stop()
-
-                # --- Existing Routing Logic ---
-                elif any(word in prompt_lower for word in ['missing', 'impute', 'null', 'nan', 'drop']):
-                    tool_function = missing_vals
-                elif any(word in prompt_lower for word in ['summary', 'describe', 'stats', 'mean', 'median', 'mode']):
-                    tool_function = get_summaries
                 else:
-                    # Fallback to a general Q&A if no tool matches
-                    st.info("No specific tool matched. Forwarding to general chat.")
-                    response_content = "Please ask about cleaning, missing values, or summaries."
-
-                if 'tool_function' in locals():
-                    generated_code = tool_function(st.session_state.df, prompt, st.session_state.api_key)
-                    
                     output_buffer = io.StringIO()
                     with redirect_stdout(output_buffer):
                         temp_df = st.session_state.df.copy()
-                        local_scope = {'df': temp_df, 'pd': pd, 'np': np}
+                        local_scope = {
+                            'df': temp_df, 
+                            'pd': pd, 
+                            'np': np,
+                            'missing_vals': missing_vals,
+                            'get_summaries': get_summaries,
+                            'api_key': st.session_state.api_key
+                        }
                         exec(generated_code, globals(), local_scope)
                         st.session_state.df = local_scope.get('df', st.session_state.df)
 
@@ -424,7 +455,7 @@ def main():
                         response_content = "Action completed. The DataFrame may have been updated."
 
             except Exception as e:
-                response_content = f"An unexpected error occurred in the main application logic: {e}"
+                response_content = f"An unexpected error occurred: {e}"
 
             st.markdown(response_content)
             st.session_state.messages.append({"role": "assistant", "content": response_content})
